@@ -1,0 +1,3 @@
+[submodule "vendor/wireguard-tools"]
+	path = vendor/wireguard-tools
+	url = https://github.com/WireGuard/wireguard-tools

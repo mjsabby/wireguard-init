@@ -1,0 +1,3 @@
+src/wireguard-init
+initramfs/*
+initramfs.cpio.gz
