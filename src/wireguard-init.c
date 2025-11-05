@@ -44,6 +44,7 @@
 #define WG_INTERFACE       "wg0"
 #define WG_IP_ADDRESS      "10.100.0.1"
 #define WG_NETMASK         "255.255.255.0"
+#define WG_MTU             1420 /* Standard: 1500 - 80 (WireGuard overhead) */
 #define WG_CONFIG_PATH     "/wireguard.conf"
 #define HTTP_PORT          8080
 #define ENABLE_IP_FORWARD  1    /* Set to 0 if you don't need forwarding */
@@ -53,6 +54,32 @@
  * ============================================================================ */
 
 #include <fcntl.h>
+
+static int set_interface_mtu(const char *ifname, int mtu)
+{
+	int sock;
+	struct ifreq ifr;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		perror("socket");
+		return -1;
+	}
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+	ifr.ifr_mtu = mtu;
+
+	if (ioctl(sock, SIOCSIFMTU, &ifr) < 0) {
+		perror("SIOCSIFMTU");
+		close(sock);
+		return -1;
+	}
+
+	close(sock);
+	printf("Interface %s MTU set to %d\n", ifname, mtu);
+	return 0;
+}
 
 static int bring_interface_up(const char *ifname)
 {
@@ -158,6 +185,92 @@ static int enable_ip_forwarding(void)
 
 	close(fd);
 	printf("IP forwarding enabled\n");
+	return 0;
+}
+
+static int add_route_for_allowedip(const char *ifname, const struct wgallowedip *allowedip)
+{
+	int sock;
+	struct rtentry route;
+	struct sockaddr_in *addr;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		perror("socket for route");
+		return -1;
+	}
+
+	memset(&route, 0, sizeof(route));
+
+	/* Only handle IPv4 for now */
+	if (allowedip->family != AF_INET) {
+		close(sock);
+		return 0;  /* Skip IPv6 - not an error */
+	}
+
+	/* Set destination */
+	addr = (struct sockaddr_in *)&route.rt_dst;
+	addr->sin_family = AF_INET;
+	memcpy(&addr->sin_addr, &allowedip->ip4, sizeof(struct in_addr));
+
+	/* Set netmask */
+	addr = (struct sockaddr_in *)&route.rt_genmask;
+	addr->sin_family = AF_INET;
+	/* Convert CIDR to netmask */
+	if (allowedip->cidr == 32) {
+		addr->sin_addr.s_addr = htonl(0xFFFFFFFF);
+	} else if (allowedip->cidr == 0) {
+		addr->sin_addr.s_addr = 0;
+	} else {
+		addr->sin_addr.s_addr = htonl(~((1U << (32 - allowedip->cidr)) - 1));
+	}
+
+	/* Set interface */
+	route.rt_dev = (char *)ifname;
+	route.rt_flags = RTF_UP;
+
+	if (ioctl(sock, SIOCADDRT, &route) < 0) {
+		if (errno != EEXIST) {  /* Ignore if route already exists */
+			perror("SIOCADDRT");
+			close(sock);
+			return -1;
+		}
+	}
+
+	close(sock);
+	return 0;
+}
+
+static int add_routes_for_peers(const char *ifname)
+{
+	struct wgdevice *device = NULL;
+	struct wgpeer *peer;
+	struct wgallowedip *allowedip;
+	int route_count = 0;
+
+	/* Get device configuration to read AllowedIPs */
+	if (ipc_get_device(&device, ifname) < 0) {
+		fprintf(stderr, "Failed to get device info for routes\n");
+		return -1;
+	}
+
+	/* Iterate through all peers */
+	for_each_wgpeer(device, peer) {
+		/* Iterate through all AllowedIPs for this peer */
+		for_each_wgallowedip(peer, allowedip) {
+			if (add_route_for_allowedip(ifname, allowedip) == 0) {
+				char ip_str[INET6_ADDRSTRLEN];
+				if (allowedip->family == AF_INET) {
+					inet_ntop(AF_INET, &allowedip->ip4, ip_str, sizeof(ip_str));
+					printf("  Route added: %s/%d via %s\n", ip_str, allowedip->cidr, ifname);
+					route_count++;
+				}
+			}
+		}
+	}
+
+	free_wgdevice(device);
+	printf("Added %d route(s) for AllowedIPs\n", route_count);
 	return 0;
 }
 
@@ -355,16 +468,28 @@ static int setup_wireguard(const char *config_path)
 		goto cleanup;
 	}
 
+	/* Assign IP address to WireGuard interface (before bringing up) */
+	if (set_interface_address(WG_INTERFACE, WG_IP_ADDRESS, WG_NETMASK) < 0) {
+		fprintf(stderr, "Failed to assign IP to %s\n", WG_INTERFACE);
+		goto cleanup;
+	}
+
+	/* Set MTU (before bringing up) */
+	if (set_interface_mtu(WG_INTERFACE, WG_MTU) < 0) {
+		fprintf(stderr, "Warning: Failed to set MTU on %s\n", WG_INTERFACE);
+		/* Continue anyway - not critical */
+	}
+
 	/* Bring WireGuard interface up */
 	if (bring_interface_up(WG_INTERFACE) < 0) {
 		fprintf(stderr, "Failed to bring up %s\n", WG_INTERFACE);
 		goto cleanup;
 	}
 
-	/* Assign IP address to WireGuard interface */
-	if (set_interface_address(WG_INTERFACE, WG_IP_ADDRESS, WG_NETMASK) < 0) {
-		fprintf(stderr, "Failed to assign IP to %s\n", WG_INTERFACE);
-		goto cleanup;
+	/* Add routes for AllowedIPs (critical for server-to-peer traffic) */
+	if (add_routes_for_peers(WG_INTERFACE) < 0) {
+		fprintf(stderr, "Warning: Failed to add routes for AllowedIPs\n");
+		/* Continue anyway - interface is still functional for incoming */
 	}
 
 	printf("WireGuard interface configured: %s = %s/%s\n", WG_INTERFACE, WG_IP_ADDRESS, WG_NETMASK);
