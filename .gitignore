@@ -1,3 +1,5 @@
+wireguard.bin
 src/wireguard-init
+src/.vscode/*
 initramfs/*
 initramfs.cpio.gz
